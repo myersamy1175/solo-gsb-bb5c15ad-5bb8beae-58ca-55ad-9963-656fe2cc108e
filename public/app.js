@@ -11,6 +11,9 @@
  *   换题 / 拖动进度后循环区间与播放 / 暂停状态保持，且不会越过较短音频
  * - 可选电平匹配：统一时间轴内汇总各声道样本计算 RMS，
  *   以较安静音源为基准仅衰减较响者（-24～0 dB），A / B / X 各经一个 GainNode
+ * - A/B/X 切换使用可配置（5～100 ms，可关闭）等功率交叉淡化：新旧音源
+ *   从同一时间位置并行播放，旧源 cos 曲线淡出、新源 sin 曲线淡入；连续
+ *   快速切换时从当前实时增益平滑转向最后一次选择，过时节点与回调立即取消
  */
 
 const $ = (sel) => document.querySelector(sel);
@@ -55,11 +58,19 @@ const buffers = { A: null, B: null, X: null };
 const xCache = new Map();    // trialIndex -> { buf, rms }
 let timeline = 0;            // 统一时间轴（较短时长，秒）
 
-let currentSrc = 'A';        // 当前音源 'A' | 'B' | 'X'
+let currentSrc = 'A';        // 最后选择的音源 'A' | 'B' | 'X'（淡化中也立即指向目标）
 let playing = false;
-let sourceNode = null;
-let startCtxTime = 0;        // 本次播放起点对应的 AudioContext 时间
+let startCtxTime = 0;        // 本次播放起点对应的 AudioContext 时间（进度锚点，淡化期间不动）
 let startOffset = 0;         // 本次播放起点对应的音频位置（秒）
+
+// 多声部播放：交叉淡化期间新旧音源从同一位置并行播放。
+// voices: 音源键 -> { key, node, fg(淡化用 GainNode), useLoop }
+// 路由：BufferSource -> fg(交叉淡化) -> gains[key](电平匹配) -> destination
+const voices = new Map();
+let primaryVoice = null;     // 负责播放到时间轴末尾自然结束的声部（最后选择的音源）
+let fade = null;             // 进行中的交叉淡化 { t0, dur, start: {A,B,X}, target }
+let fadeGen = 0;             // 代号：使上一次淡化排程的收尾回调作废
+let fadeTimer = 0;
 
 // 电平匹配：A / B / X 各经一个 GainNode，仅衰减较响音源
 const gains = { A: null, B: null, X: null };
@@ -72,6 +83,12 @@ let levelMatchOn = false;    // 开关状态
 const MIN_LOOP = 0.5;        // 循环区间最短时长（秒）
 let loopIn = null;
 let loopOut = null;
+
+// 交叉淡化：等功率（sin/cos），可配置 5～100 ms，0 = 关闭（即时硬切）
+const FADE_MIN_MS = 5;
+const FADE_MAX_MS = 100;
+const FADE_STEPS = 16;       // AudioParam 线性斜坡分段数（分段足够密，听感等同平滑曲线）
+let fadeMs = 20;
 
 // ---------------------------------------------------------------------------
 // 视图切换
@@ -96,76 +113,254 @@ function position() {
   return Math.min(t, timeline);
 }
 
-function stopSource() {
-  if (sourceNode) {
-    sourceNode.onended = null;
-    try { sourceNode.stop(); } catch (_) { /* 已停止 */ }
-    sourceNode.disconnect();
-    sourceNode = null;
-  }
-}
-
 function play() {
   if (playing || !buffers[currentSrc]) return;
   if (startOffset >= timeline) startOffset = 0;
-  const buf = buffers[currentSrc];
-  // 循环启用且起点在出点之前：用原生 loop，到达出点（loopEnd）即采样级
-  // 精确跳回入点（loopStart）；loopIn/loopOut ≤ timeline ≤ 各音源时长，
-  // 因此不会越过较短音频的有效时长
-  const useLoop = loopActive() && startOffset < loopOut;
-  const remain = Math.max(0, Math.min(timeline, buf.duration) - startOffset);
-  if (!useLoop && remain <= 0) return;
-
-  sourceNode = actx.createBufferSource();
-  sourceNode.buffer = buf;
-  sourceNode.connect(gains[currentSrc]); // 经各音源的 GainNode 输出（电平匹配）
-  if (useLoop) {
-    sourceNode.loop = true;
-    sourceNode.loopStart = loopIn;
-    sourceNode.loopEnd = loopOut;
-    sourceNode.start(0, startOffset);
-  } else {
-    sourceNode.onended = () => {
-      // 自然播放到时间轴末尾
-      sourceNode = null;
-      playing = false;
-      startOffset = 0;
-      updatePlayBtn();
-    };
-    sourceNode.start(0, startOffset, remain);
-  }
+  const v = createVoice(currentSrc, startOffset, true);
+  if (!v) return;
   startCtxTime = actx.currentTime;
   playing = true;
   updatePlayBtn();
 }
 
+/**
+ * 创建并启动一个播放声部（不改动 playing / 进度锚点）。
+ * 循环启用且起点在出点之前：用原生 loop，到达出点（loopEnd）即采样级
+ * 精确跳回入点（loopStart）；否则只在统一时间轴剩余时长内播放。
+ * 返回声部对象；起点已在时间轴之外（剩余时长 ≤ 0）时返回 null。
+ */
+function createVoice(key, offset, isPrimary) {
+  const buf = buffers[key];
+  if (!buf) return null;
+  const useLoop = loopActive() && offset < loopOut;
+  const remain = Math.max(0, Math.min(timeline, buf.duration) - offset);
+  if (!useLoop && remain <= 0) return null;
+
+  const node = actx.createBufferSource();
+  node.buffer = buf;
+  const fg = actx.createGain();
+  // 主声部独占播放：满幅起步；淡化中的新声部从 0 起步，由淡化曲线抬升
+  fg.gain.value = isPrimary ? 1 : 0;
+  node.connect(fg).connect(gains[key]); // fg：交叉淡化；gains[key]：电平匹配
+  if (useLoop) {
+    node.loop = true;
+    node.loopStart = loopIn;
+    node.loopEnd = loopOut;
+    node.start(0, offset);
+  } else {
+    node.start(0, offset, remain);
+  }
+
+  const v = { key, node, fg, useLoop };
+  voices.set(key, v);
+  if (isPrimary) {
+    primaryVoice = v;
+    // 只有最后选择的音源自然播到时间轴末尾才结束播放状态
+    node.onended = () => {
+      if (primaryVoice !== v) return;   // 已被后选声部取代
+      endTransport();
+    };
+  }
+  return v;
+}
+
+/** 主声部自然播放到时间轴末尾：收束到停止态（位置回到 0，与原有语义一致） */
+function endTransport() {
+  teardownVoices();
+  playing = false;
+  startOffset = 0;
+  updatePlayBtn();
+  updateTransport();
+}
+
+/**
+ * 收束并拆除全部声部：淡化增益立即归零，停止 / 断开节点，清空声部表。
+ * 进行中淡化的排程与回调一律作废，避免过时节点继续发声或叠加。
+ * 暂停 / 拖动 / 换题 / 循环变更后再由调用方以当前音源重新建立单一声部。
+ */
+function teardownVoices() {
+  cancelFade();
+  const now = actx ? actx.currentTime : 0;
+  for (const v of voices.values()) {
+    holdGain(v.fg.gain, 0, now);
+    v.node.onended = null;
+    try { v.node.stop(now); } catch (_) { /* 已停止 */ }
+    try { v.node.disconnect(); } catch (_) { /* 已断开 */ }
+  }
+  voices.clear();
+  primaryVoice = null;
+}
+
+/** 取消进行中的淡化（保留声部与当前实时增益），并使待执行回调作废 */
+function cancelFade() {
+  if (fadeTimer) { clearTimeout(fadeTimer); fadeTimer = 0; }
+  fade = null;
+  fadeGen++;
+}
+
 function pause() {
   if (!playing) return;
-  startOffset = position();
-  stopSource();
+  const pos = position();
+  teardownVoices(); // 暂停即收束：淡化声部全部停止，状态确定
   playing = false;
+  startOffset = pos;
   updatePlayBtn();
 }
 
-/** 切换 A / B / X，保持播放位置与暂停状态 */
+/**
+ * 切换 A / B / X，保持播放位置与暂停状态。
+ * 播放中且淡化开启：新旧音源从同一时间位置并行播放，做等功率交叉淡化；
+ * 连续快速点击时以当前实时增益为新起点，重新排程到最后一次选择，
+ * 上一次淡化的节点收尾与回调立即作废，音量始终等功率、不叠加。
+ */
 function switchSource(which) {
   if (which === currentSrc || !buffers[which]) return;
-  const pos = position();
-  const wasPlaying = playing;
-  stopSource();
-  playing = false;
   currentSrc = which;
-  startOffset = pos;
-  if (wasPlaying) play();
   updateSrcButtons();
+  if (!playing) {
+    // 暂停态切换：只换音源标记，下次播放从新音源当前位置开始（保持原语义）
+    teardownVoices();
+    return;
+  }
+  if (fadeMs <= 0) {
+    // 关闭淡化：原位置即时硬切
+    const pos = position();
+    teardownVoices();
+    startOffset = pos;
+    startCtxTime = actx.currentTime;
+    const v = createVoice(which, pos, true);
+    if (!v) endTransport();
+    return;
+  }
+  startCrossfade(which);
 }
 
+/**
+ * 从当前实时增益出发，等功率交叉淡化到目标音源。
+ * 等功率：目标沿 sin 曲线 0→1、其余沿各自曲线 →0，且每一刻各声部
+ * 增益平方和恒为 1，总响度不变。所有现有声部与新声部共用同一进度锚点
+ * （同一 startCtxTime / startOffset），从同一时间位置并行播放，无进度漂移。
+ */
+function startCrossfade(targetKey) {
+  const now = actx.currentTime;
+  const dur = fadeMs / 1000;
+
+  // 目标声部不存在则在当前位置补建（与在播声部同一锚点）
+  if (!voices.has(targetKey)) {
+    const v = createVoice(targetKey, position(), false);
+    if (!v) return; // 已到时间轴末尾（理论上在播时不会发生）
+  }
+
+  const myGen = ++fadeGen;              // 使上一次淡化的收尾回调作废
+  if (fadeTimer) clearTimeout(fadeTimer);
+
+  const t0 = now;
+  const startGain = {};                 // 淡化起点的实时增益快照
+  for (const k of voices.keys()) startGain[k] = clamp01(voices.get(k).fg.gain.value);
+  fade = { t0, dur, start: startGain, target: targetKey };
+
+  // 等功率分配（平方和恒为 1，且每个声部各自单调）：
+  // - 目标声部：sin(θ)，θ 从 asin(起点目标增益) 转到 π/2（g₀→1，单调上升）
+  // - 全部淡出声部共享 cos(θ) 包络（单调降到 0），按起点增益平方占比恒定分配。
+  //   由于起点快照满足 Σg²=1，淡出起点合计恰为 cos(θ 起点)，故全程平方和为 1。
+  const keys = [...voices.keys()];
+  const gT0 = startGain[targetKey] || 0;
+  const a0 = Math.asin(gT0);
+  let stalePower = 0;
+  for (const k of keys) if (k !== targetKey) stalePower += startGain[k] ** 2;
+  const staleBase = Math.sqrt(stalePower);   // = cos(a0)（快照等功率时）
+  const share = {};
+  for (const k of keys) {
+    share[k] = k === targetKey
+      ? 1
+      : (staleBase > 1e-9 ? startGain[k] / staleBase : 0);
+  }
+
+  const curves = {};
+  for (const k of keys) curves[k] = new Array(FADE_STEPS + 1);
+  for (let i = 0; i <= FADE_STEPS; i++) {
+    const u = i / FADE_STEPS;
+    const theta = a0 + (Math.PI / 2 - a0) * u;
+    const env = Math.cos(theta);
+    for (const k of keys) {
+      curves[k][i] = k === targetKey ? Math.sin(theta) : share[k] * env;
+    }
+  }
+
+  for (const k of keys) {
+    const param = voices.get(k).fg.gain;
+    // 作废旧自动化并在 t0 建立明确起点事件，再以多段线性斜坡走完等功率曲线
+    try {
+      if (typeof param.cancelAndHoldAtTime === 'function') {
+        param.cancelAndHoldAtTime(t0);
+      } else {
+        param.cancelScheduledValues(t0);
+      }
+    } catch (_) { /* 无待排事件 */ }
+    param.setValueAtTime(curves[k][0], t0 + 1e-6);
+    for (let i = 1; i <= FADE_STEPS; i++) {
+      param.linearRampToValueAtTime(curves[k][i], t0 + (dur * i) / FADE_STEPS);
+    }
+  }
+
+  // 淡化结束：目标增益钉为 1，过时声部停止并断开（等功率已精确收敛）
+  fadeTimer = setTimeout(() => {
+    fadeTimer = 0;
+    if (myGen !== fadeGen) return;      // 已被新的切换 / 收束取代
+    fade = null;
+    const target = voices.get(targetKey);
+    for (const [k, v] of voices) {
+      if (k === targetKey) continue;
+      v.node.onended = null;
+      try { v.node.stop(); } catch (_) { /* 已停止 */ }
+      try { v.node.disconnect(); } catch (_) { /* 已断开 */ }
+      voices.delete(k);
+    }
+    if (target) {
+      // 淡化曲线终点已为 1，这里取消残留自动化并钉死为满幅（避免任何再插值）
+      try { target.fg.gain.cancelScheduledValues(actx.currentTime); } catch (_) { /* 无 */ }
+      target.fg.gain.value = 1;
+      primaryVoice = target;
+    } else {
+      endTransport(); // 目标声部已不在（极端时序）：一致收束到停止态
+    }
+  }, fadeMs + 30);
+}
+
+const clamp01 = (x) => Math.max(0, Math.min(1, x));
+
+/**
+ * 在 time 时刻把 AudioParam 固定为指定值并作废其后续自动化（无爆音）。
+ * 优先 cancelAndHoldAtTime（保持到该时刻的连续值），再补一个定值事件；
+ * 不支持时退化为「取消后续排程 + 立即定值」。
+ */
+function holdGain(param, value, time) {
+  try {
+    if (typeof param.cancelAndHoldAtTime === 'function') {
+      param.cancelAndHoldAtTime(time);
+      param.setValueAtTime(value, time + 1e-6);
+      return;
+    }
+  } catch (_) { /* 退化处理见下 */ }
+  try { param.cancelScheduledValues(time); } catch (_) { /* 无待排事件 */ }
+  param.setTargetAtTime(value, time, 0.001);
+  try { param.setValueAtTime(value, time + 0.004); } catch (_) { /* 忽略 */ }
+}
+
+/** 拖动进度：收束淡化并在新位置以当前音源重建（保持播放 / 暂停状态） */
 function seekTo(t) {
   const wasPlaying = playing;
-  stopSource();
+  const pos = Math.max(0, Math.min(t, timeline));
+  if (wasPlaying) teardownVoices();
   playing = false;
-  startOffset = Math.max(0, Math.min(t, timeline));
-  if (wasPlaying) play();
+  startOffset = pos;
+  if (wasPlaying) {
+    const v = createVoice(currentSrc, pos, true);
+    if (v) {
+      startCtxTime = actx.currentTime;
+      playing = true;
+    }
+  }
   updateTransport();
 }
 
@@ -190,13 +385,14 @@ function normalizeLoop() {
 
 /**
  * 循环区间变更后无缝重建播放（保持播放 / 暂停状态）：
- * 当前位置已越过新出点时立即跳回入点；循环未参与播放时不打断当前声音
+ * 当前位置已越过新出点时立即跳回入点；循环未参与播放时不打断当前声音。
+ * 进行中的交叉淡化在此一致收束：只保留当前音源从新配置重建。
  */
 function restartForLoop(pos, wasActive) {
   const snap = loopActive() && pos >= loopOut;
   if (playing) {
     if (!wasActive && !loopActive()) return;
-    stopSource();
+    teardownVoices();
     playing = false;
     startOffset = snap ? loopIn : pos;
     play();
@@ -329,14 +525,22 @@ async function loadTrial(n) {
   buffers.X = cached.buf;
   rms.X = cached.rms;
   refreshLevelMatch(); // X 的调整量随题更新
-  // 若当前正在听 X，无缝换成本题的 X（保持位置与播放状态）
-  if (currentSrc === 'X') {
+  // 若当前正在听 X，把在播声部换成本题的 X（保持位置与播放状态）。
+  // 交叉淡化中则先收束到 X（取消过时声部与回调），再换缓冲重建，
+  // 避免旧题 X 声部与新题 X 声部叠加发声。
+  if (currentSrc === 'X' && playing) {
     const pos = position();
-    const wasPlaying = playing;
-    stopSource();
+    teardownVoices();
     playing = false;
     startOffset = pos;
-    if (wasPlaying) play();
+    const v = createVoice('X', pos, true);
+    if (v) {
+      startCtxTime = actx.currentTime;
+      playing = true;
+    }
+  } else {
+    // 暂停 / 当前听 A·B：淡化里可能残留正在淡出的 X，直接停掉它再换缓冲
+    teardownVoices();
   }
   renderTrial();
 }
@@ -417,6 +621,11 @@ async function enterTest() {
       gains[k].connect(actx.destination);
     }
   }
+
+  // 新测试 / 恢复：播放引擎彻底复位（也清掉上一轮可能残留的淡化声部）
+  teardownVoices();
+  fadeMs = readFadeMs();
+  renderFadeInfo();
 
   buffers.A = await fetchBuffer(`/api/session/${session.id}/audio/A`);
   buffers.B = await fetchBuffer(`/api/session/${session.id}/audio/B`);
@@ -597,7 +806,7 @@ $('#btnLoopClear').addEventListener('click', () => {
   const pos = position(); // 先取当前实际位置（旧循环配置下的回绕位置）
   loopIn = loopOut = null;
   if (playing && wasActive) {
-    stopSource();
+    teardownVoices();
     playing = false;
     startOffset = pos;
     play();
@@ -610,6 +819,51 @@ $('#chkLevelMatch').addEventListener('change', (e) => {
   levelMatchOn = e.target.checked;
   applyGains(); // 关闭后立即恢复原始电平
   renderLevelInfo();
+});
+
+// ---------------------------------------------------------------------------
+// 交叉淡化设置：等功率、5～100 ms，可关闭
+// ---------------------------------------------------------------------------
+
+/** 读取界面淡化设置：勾选时取 5～100 ms，未勾选为 0（即时硬切） */
+function readFadeMs() {
+  if (!$('#chkCrossfade').checked) return 0;
+  const n = parseInt($('#fadeMs').value, 10);
+  if (!Number.isFinite(n)) return fadeMs;
+  return Math.max(FADE_MIN_MS, Math.min(FADE_MAX_MS, n));
+}
+
+function renderFadeInfo() {
+  $('#fadeMs').disabled = !$('#chkCrossfade').checked;
+  $('#fadeMsVal').textContent = $('#chkCrossfade').checked
+    ? `${fadeMs} ms`
+    : '已关闭';
+}
+
+$('#chkCrossfade').addEventListener('change', () => {
+  fadeMs = readFadeMs();
+  // 关闭时若正在淡化，立即收束到最后选择的音源，避免遗留淡出声部
+  if (fadeMs === 0 && playing) {
+    const pos = position();
+    teardownVoices();
+    playing = false;
+    startOffset = pos;
+    const v = createVoice(currentSrc, pos, true);
+    if (v) {
+      startCtxTime = actx.currentTime;
+      playing = true;
+    }
+  }
+  renderFadeInfo();
+});
+
+$('#fadeMs').addEventListener('input', (e) => {
+  const n = parseInt(e.target.value, 10);
+  if (!Number.isFinite(n)) return;
+  fadeMs = Math.max(FADE_MIN_MS, Math.min(FADE_MAX_MS, n));
+  e.target.value = fadeMs;
+  // 仅影响之后的切换；淡化进行中不打断，保证当前过渡平滑完成
+  renderFadeInfo();
 });
 
 $('#btnPrev').addEventListener('click', () => { if (currentTrial > 0) loadTrial(currentTrial - 1); });
@@ -647,6 +901,7 @@ $('#btnSubmit').addEventListener('click', async () => {
 
 $('#btnAgain').addEventListener('click', async () => {
   pause();
+  teardownVoices();
   if (session) {
     await fetch(`/api/session/${session.id}`, { method: 'DELETE' }).catch(() => {});
   }

@@ -89,6 +89,18 @@
           <span id="levelInfo" class="hint">A 0.0 dB · B 0.0 dB</span>
         </div>
 
+        <div class="crossfade">
+          <label class="lm-toggle" title="切换 A / B / X 时新旧音源从同一时间位置并行播放，按等功率（sin/cos）曲线完成增益交接，避免爆音与音量叠加；连续快速点击会平滑转向最后一次选择">
+            <input type="checkbox" id="chkCrossfade" checked>
+            <span>切换交叉淡化（等功率）</span>
+          </label>
+          <label class="fade-dur">
+            <span>时长</span>
+            <input type="range" id="fadeMs" min="5" max="100" step="1" value="20">
+            <span id="fadeMsVal" class="hint">20 ms</span>
+          </label>
+        </div>
+
         <div class="answer-box">
           <p>本题中 X 是哪一个？</p>
           <div class="answer-btns">
@@ -100,7 +112,7 @@
         <div id="progress" class="progress" aria-label="答题进度"></div>
 
         <button id="btnSubmit" class="danger" disabled>提交并揭晓答案</button>
-        <p class="hint">提示：在 A / B / X 之间切换时，播放位置与暂停状态保持不变；可用「设为入点 / 设为出点」循环试听某一片段，切换音源、换题或拖动进度后循环依然有效；可随时返回已答题目修改答案，提交后一次性揭晓。</p>
+        <p class="hint">提示：在 A / B / X 之间切换时，播放位置与暂停状态保持不变，并可开启 5～100 ms 等功率交叉淡化（连续快速点击会平滑转向最后一次选择）；可用「设为入点 / 设为出点」循环试听某一片段，切换音源、换题或拖动进度后循环依然有效；可随时返回已答题目修改答案，提交后一次性揭晓。</p>
       </div>
     </section>
 

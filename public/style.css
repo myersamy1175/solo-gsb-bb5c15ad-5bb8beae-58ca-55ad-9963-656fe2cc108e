@@ -225,6 +225,32 @@ input[type="range"] {
 #levelInfo { font-variant-numeric: tabular-nums; }
 #levelInfo.off { opacity: 0.55; }
 
+/* 交叉淡化设置 */
+.crossfade {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding-top: 0.2rem;
+}
+
+.fade-dur {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+.fade-dur input[type="range"] { flex: 1; }
+
+#fadeMsVal {
+  min-width: 3.6rem;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+#fadeMs:disabled { opacity: 0.4; cursor: not-allowed; }
+
 /* 作答 */
 .answer-box p { margin: 0 0 0.5rem; font-weight: 600; }
 
