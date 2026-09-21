@@ -5,6 +5,9 @@
  * 播放引擎基于 Web Audio API：
  * - A / B 解码一次，X 按题解码并缓存
  * - 切换音源 / 切换题目时保持播放位置与暂停状态
+ * - A / B / X 切换可做等功率交叉淡化（5～100 ms，可关闭）：新旧音源从
+ *   同一时间位置并行播放，按 sin/cos 曲线完成增益交接；快速连续切换时
+ *   从当前听感增益重新锚定，取消过时节点与回调，不叠加、不爆音、不漂移
  * - 统一时间轴 = min(A 时长, B 时长)
  * - 片段循环：入点 / 出点基于统一时间轴（区间 ≥ 0.5 秒），启用时用
  *   AudioBufferSourceNode 原生 loop 在出点处采样级跳回入点；切换音源 /
@@ -57,9 +60,15 @@ let timeline = 0;            // 统一时间轴（较短时长，秒）
 
 let currentSrc = 'A';        // 当前音源 'A' | 'B' | 'X'
 let playing = false;
-let sourceNode = null;
-let startCtxTime = 0;        // 本次播放起点对应的 AudioContext 时间
-let startOffset = 0;         // 本次播放起点对应的音频位置（秒）
+const voices = [];           // 当前发声实例（交叉淡化期间新旧并行；最后一个为位置跟踪基准）
+let startCtxTime = 0;        // 最新发声实例起点对应的 AudioContext 时间
+let startOffset = 0;         // 最新发声实例起点对应的音频位置（秒）
+
+// 交叉淡化：A / B / X 切换时新旧音源并行播放，按等功率曲线交接增益
+const XFADE_MIN_MS = 5;      // 淡化时长下限（毫秒）
+const XFADE_MAX_MS = 100;    // 淡化时长上限（毫秒）
+let crossfadeOn = true;      // 开关状态
+let crossfadeMs = 30;        // 淡化时长（毫秒，5～100）
 
 // 电平匹配：A / B / X 各经一个 GainNode，仅衰减较响音源
 const gains = { A: null, B: null, X: null };
@@ -96,45 +105,122 @@ function position() {
   return Math.min(t, timeline);
 }
 
-function stopSource() {
-  if (sourceNode) {
-    sourceNode.onended = null;
-    try { sourceNode.stop(); } catch (_) { /* 已停止 */ }
-    sourceNode.disconnect();
-    sourceNode = null;
+// 等功率交叉淡化曲线：淡入 sin、淡出 cos（0→π/2），交接中总功率保持恒定
+const XFADE_STEPS = 64;      // 曲线采样点数
+const xfadeCurves = new Map();   // 'in:30' / 'out:30' -> Float32Array（按时长缓存）
+
+function xfadeCurve(kind, ms) {
+  const key = kind + ':' + ms;
+  let c = xfadeCurves.get(key);
+  if (!c) {
+    c = new Float32Array(XFADE_STEPS);
+    for (let i = 0; i < XFADE_STEPS; i++) {
+      const a = (i / (XFADE_STEPS - 1)) * (Math.PI / 2);
+      c[i] = kind === 'in' ? Math.sin(a) : Math.cos(a);
+    }
+    xfadeCurves.set(key, c);
   }
+  return c;
+}
+
+/** 淡化时长归一化：限制在 5～100 ms，非法值回退为默认 30 ms */
+function clampXfadeMs(v) {
+  const n = Math.round(Number(v));
+  if (!Number.isFinite(n)) return 30;
+  return Math.min(XFADE_MAX_MS, Math.max(XFADE_MIN_MS, n));
+}
+
+/** 回收发声实例：取消淡化定时器与 ended 回调，停止并断开节点 */
+function removeVoice(v) {
+  if (v.timer) { clearTimeout(v.timer); v.timer = null; }
+  v.node.onended = null;
+  try { v.node.stop(); } catch (_) { /* 已停止 */ }
+  v.node.disconnect();
+  v.fade.disconnect();
+  const i = voices.indexOf(v);
+  if (i >= 0) voices.splice(i, 1);
+}
+
+/** 立即停止全部发声实例（暂停 / 拖动 / 换题 / 循环变更时一致收束过渡） */
+function stopAllVoices() {
+  while (voices.length) removeVoice(voices[voices.length - 1]);
+}
+
+/**
+ * 从指定位置创建发声实例：BufferSource → 淡化 GainNode → 电平匹配 GainNode。
+ * 循环设置与电平匹配对新实例同样生效；fadeInMs > 0 时按等功率 sin 曲线淡入。
+ * 返回实例；无可播内容（已到时间轴末尾且无循环）时返回 null。
+ */
+function startVoice(src, offset, fadeInMs) {
+  const buf = buffers[src];
+  // 循环启用且起点在出点之前：用原生 loop，到达出点（loopEnd）即采样级
+  // 精确跳回入点（loopStart）；loopIn/loopOut ≤ timeline ≤ 各音源时长，
+  // 因此不会越过较短音频的有效时长
+  const useLoop = loopActive() && offset < loopOut;
+  const remain = Math.max(0, Math.min(timeline, buf.duration) - offset);
+  if (!useLoop && remain <= 0) return null;
+
+  const node = actx.createBufferSource();
+  node.buffer = buf;
+  const fade = actx.createGain();   // 交叉淡化包络（电平匹配增益在 gains[src] 上）
+  node.connect(fade);
+  fade.connect(gains[src]);         // 经各音源的 GainNode 输出（电平匹配）
+  const v = { src, node, fade, timer: null };
+
+  if (useLoop) {
+    node.loop = true;
+    node.loopStart = loopIn;
+    node.loopEnd = loopOut;
+    node.start(0, offset);
+  } else {
+    node.onended = () => {
+      // 自然播放到时间轴末尾；仅当本实例仍是当前（最新）实例时收束播放状态
+      const isCurrent = voices[voices.length - 1] === v;
+      removeVoice(v);
+      if (isCurrent) {
+        playing = false;
+        startOffset = 0;
+        updatePlayBtn();
+      }
+    };
+    node.start(0, offset, remain);
+  }
+
+  const now = actx.currentTime;
+  if (fadeInMs > 0) {
+    fade.gain.setValueAtTime(0, now);
+    fade.gain.setValueCurveAtTime(xfadeCurve('in', fadeInMs), now, fadeInMs / 1000);
+  } else {
+    fade.gain.value = 1;
+  }
+
+  voices.push(v);
+  // 位置跟踪锚点切换到最新实例（显示位置以它为准，避免进度漂移）
+  startCtxTime = now;
+  startOffset = offset;
+  return v;
+}
+
+/**
+ * 让发声实例从当前听感增益按等功率 cos 曲线淡出，结束后回收。
+ * 快速连续切换时，进行中的淡化被取消（定时器与增益事件）并重新锚定，
+ * 始终从当前实际增益继续淡出，不会音量叠加或爆音。
+ */
+function fadeOutVoice(v, fadeMs) {
+  if (v.timer) { clearTimeout(v.timer); v.timer = null; }
+  const now = actx.currentTime;
+  const g = v.fade.gain.value;      // 当前听感增益（含进行中淡化的进度）
+  const p = v.fade.gain;
+  p.cancelScheduledValues(now);
+  const base = xfadeCurve('out', fadeMs);
+  p.setValueCurveAtTime(g === 1 ? base : base.map((x) => x * g), now, fadeMs / 1000);
+  v.timer = setTimeout(() => removeVoice(v), fadeMs + 80);
 }
 
 function play() {
   if (playing || !buffers[currentSrc]) return;
   if (startOffset >= timeline) startOffset = 0;
-  const buf = buffers[currentSrc];
-  // 循环启用且起点在出点之前：用原生 loop，到达出点（loopEnd）即采样级
-  // 精确跳回入点（loopStart）；loopIn/loopOut ≤ timeline ≤ 各音源时长，
-  // 因此不会越过较短音频的有效时长
-  const useLoop = loopActive() && startOffset < loopOut;
-  const remain = Math.max(0, Math.min(timeline, buf.duration) - startOffset);
-  if (!useLoop && remain <= 0) return;
-
-  sourceNode = actx.createBufferSource();
-  sourceNode.buffer = buf;
-  sourceNode.connect(gains[currentSrc]); // 经各音源的 GainNode 输出（电平匹配）
-  if (useLoop) {
-    sourceNode.loop = true;
-    sourceNode.loopStart = loopIn;
-    sourceNode.loopEnd = loopOut;
-    sourceNode.start(0, startOffset);
-  } else {
-    sourceNode.onended = () => {
-      // 自然播放到时间轴末尾
-      sourceNode = null;
-      playing = false;
-      startOffset = 0;
-      updatePlayBtn();
-    };
-    sourceNode.start(0, startOffset, remain);
-  }
-  startCtxTime = actx.currentTime;
+  if (!startVoice(currentSrc, startOffset, 0)) return;
   playing = true;
   updatePlayBtn();
 }
@@ -142,27 +228,45 @@ function play() {
 function pause() {
   if (!playing) return;
   startOffset = position();
-  stopSource();
+  stopAllVoices();
   playing = false;
   updatePlayBtn();
 }
 
-/** 切换 A / B / X，保持播放位置与暂停状态 */
+/**
+ * 切换 A / B / X，保持播放位置与暂停状态。
+ * 播放中且淡化开启时做等功率交叉淡化：全部旧实例从各自当前听感增益淡出
+ * 并定时回收，新实例从同一时间位置淡入，循环区间与电平匹配对新旧实例
+ * 同时生效；快速连续点击始终从当前听感平滑转向最后一次选择。
+ */
 function switchSource(which) {
   if (which === currentSrc || !buffers[which]) return;
-  const pos = position();
+  let pos = position();
+  if (pos >= timeline) pos = 0;
   const wasPlaying = playing;
-  stopSource();
-  playing = false;
+  const fadeMs = wasPlaying && crossfadeOn ? crossfadeMs : 0;
   currentSrc = which;
-  startOffset = pos;
-  if (wasPlaying) play();
+
+  if (fadeMs > 0 && voices.length) {
+    for (const v of voices) fadeOutVoice(v, fadeMs);  // 旧实例全部淡出
+    if (!startVoice(which, pos, fadeMs)) {            // 新实例同位置淡入
+      // 理论上不可达（pos 已钳制在时间轴内）；防御性收束
+      playing = false;
+      startOffset = 0;
+      updatePlayBtn();
+    }
+  } else {
+    stopAllVoices();
+    playing = false;
+    startOffset = pos;
+    if (wasPlaying) play();
+  }
   updateSrcButtons();
 }
 
 function seekTo(t) {
   const wasPlaying = playing;
-  stopSource();
+  stopAllVoices();
   playing = false;
   startOffset = Math.max(0, Math.min(t, timeline));
   if (wasPlaying) play();
@@ -196,7 +300,7 @@ function restartForLoop(pos, wasActive) {
   const snap = loopActive() && pos >= loopOut;
   if (playing) {
     if (!wasActive && !loopActive()) return;
-    stopSource();
+    stopAllVoices();
     playing = false;
     startOffset = snap ? loopIn : pos;
     play();
@@ -333,7 +437,7 @@ async function loadTrial(n) {
   if (currentSrc === 'X') {
     const pos = position();
     const wasPlaying = playing;
-    stopSource();
+    stopAllVoices();
     playing = false;
     startOffset = pos;
     if (wasPlaying) play();
@@ -439,6 +543,13 @@ async function enterTest() {
   levelMatchOn = $('#chkLevelMatch').checked;
   refreshLevelMatch();
 
+  // 交叉淡化：读取界面设置（时长非法时回退为默认 30 ms）
+  crossfadeOn = $('#chkCrossfade').checked;
+  crossfadeMs = clampXfadeMs($('#crossfadeMs').value);
+  $('#crossfadeMs').value = crossfadeMs;
+  $('#crossfadeMs').disabled = !crossfadeOn;
+
+  stopAllVoices(); // 收束可能残留的发声实例与淡化定时器
   currentSrc = 'A';
   playing = false;
   startOffset = 0;
@@ -597,7 +708,7 @@ $('#btnLoopClear').addEventListener('click', () => {
   const pos = position(); // 先取当前实际位置（旧循环配置下的回绕位置）
   loopIn = loopOut = null;
   if (playing && wasActive) {
-    stopSource();
+    stopAllVoices();
     playing = false;
     startOffset = pos;
     play();
@@ -610,6 +721,18 @@ $('#chkLevelMatch').addEventListener('change', (e) => {
   levelMatchOn = e.target.checked;
   applyGains(); // 关闭后立即恢复原始电平
   renderLevelInfo();
+});
+
+// 交叉淡化设置：时长 5～100 ms，可整体关闭；只影响之后的切换，
+// 进行中的淡化会自然走完（≤ 100 ms），不产生爆音
+$('#chkCrossfade').addEventListener('change', (e) => {
+  crossfadeOn = e.target.checked;
+  $('#crossfadeMs').disabled = !crossfadeOn;
+});
+
+$('#crossfadeMs').addEventListener('change', (e) => {
+  crossfadeMs = clampXfadeMs(e.target.value);
+  e.target.value = crossfadeMs;
 });
 
 $('#btnPrev').addEventListener('click', () => { if (currentTrial > 0) loadTrial(currentTrial - 1); });
